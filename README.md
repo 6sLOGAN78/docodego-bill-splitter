@@ -155,3 +155,51 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+1. **Paying is one conditional `UPDATE`, not "read, then write".**
+   `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL RETURNING ...`.
+   SQLite (D1) runs writes one at a time, so when two payments race only one of them can change the
+   row. The loser reads the share back: the same `Idempotency-Key` means it is a retry and gets the
+   saved result (`200`, same `paidAt`); a different key means it was already paid (`409`). There is
+   no window between a read and a write where two requests can both see "unpaid". The key is stored
+   on the share itself, and a `CHECK` makes sure `paid_at` and `idempotency_key` are always set
+   together.
+
+2. **Member order is a stored `position`, protected by the database.**
+   The split gives leftover cents to members in the order they were added, so that order must be
+   exact. Each member gets `position = MAX(position) + 1` in the same `INSERT ... SELECT` statement,
+   and `UNIQUE (home_id, position)` makes a duplicate impossible even under concurrent inserts.
+   I did not rely on timestamps (two inserts can share a millisecond) or on `rowid` order (not a
+   guarantee SQL gives you).
+
+3. **The split is a small pure function, and a bill is saved with one `batch`.**
+   `splitCents(total, n)` gives everyone `floor(total / n)` and the first `total % n` members one
+   extra cent, so shares always add up to the total and never differ by more than 1 cent. It has its
+   own unit tests (including every total from 1 to 500 against 1 to 12 members). The bill row and all
+   its share rows go into one `db.batch()`, which D1 runs as a transaction, so a failure can never
+   leave a bill without shares.
+
+**Constraints and what each one stops** (`api/migrations/0001_init.sql`):
+`*_fk` foreign keys stop members, bills or shares that point to nothing;
+`bills_total_positive_integer` and `shares_amount_non_negative_integer` stop decimal, zero or
+negative money even if a bug skips the API check; `members_home_position_unique` stops two members
+having the same place in the split order; `shares_bill_member_unique` stops a member getting two
+shares of one bill; `shares_paid_has_key` stops a share that is "paid" without a key (or the
+reverse); `*_not_blank` stop empty names and titles.
+
+**Trade-off.** The bill is split between the members the home has _when the bill is created_. A
+member added later does not owe old bills. Reading the members and writing the bill are two steps,
+so a member added in the same instant may or may not be included; I accepted that, because changing
+an existing bill later would be worse.
+
+**Web page.** Every request has an 8 second timeout and every error is turned into a readable
+message, so a `500`, an HTML error page, a slow API or a network failure shows an error instead of
+crashing. A share only shows "Paid" after the server confirms it. The page keeps one
+`Idempotency-Key` per payment attempt and reuses it on retry, so retrying after a timeout cannot pay
+twice. Extra endpoints for the page: `GET /api/homes/:homeId/bills` and
+`GET /api/homes/:homeId/members`.
+
+**AI use.** Claude (Anthropic) was used to help write the code, tests and this README. I reviewed
+and can explain every line.
